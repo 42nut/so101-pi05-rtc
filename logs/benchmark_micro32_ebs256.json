@@ -1,0 +1,69 @@
+{
+  "status": "passed",
+  "lerobot_version": "0.6.1",
+  "native_trainer_sha256": "f2c2f33358951cede0ebc96604209c515d0daff26821867354feec81725bb4de",
+  "micro_batch": 32,
+  "accumulation_steps": 8,
+  "effective_batch": 256,
+  "updates": [
+    {
+      "update": 1,
+      "loss": 0.27012690901756287,
+      "grad_norm": 6.13176155090332,
+      "elapsed_s": 29.490676758810878,
+      "loading_s": 3.14332664757967,
+      "peak_memory_gib": 37.263500690460205,
+      "effective_batch": 256
+    },
+    {
+      "update": 2,
+      "loss": 0.11179956048727036,
+      "grad_norm": 0.5740169882774353,
+      "elapsed_s": 28.536014687269926,
+      "loading_s": 2.727407133206725,
+      "peak_memory_gib": 41.28104639053345,
+      "effective_batch": 256
+    },
+    {
+      "update": 3,
+      "loss": 0.08538586087524891,
+      "grad_norm": 0.34170910716056824,
+      "elapsed_s": 28.729686906561255,
+      "loading_s": 2.847460864111781,
+      "peak_memory_gib": 41.28215837478638,
+      "effective_batch": 256
+    },
+    {
+      "update": 4,
+      "loss": 0.08574008755385876,
+      "grad_norm": 0.31523004174232483,
+      "elapsed_s": 28.63859909400344,
+      "loading_s": 2.7971915677189827,
+      "peak_memory_gib": 41.28215837478638,
+      "effective_batch": 256
+    },
+    {
+      "update": 5,
+      "loss": 0.07335828896611929,
+      "grad_norm": 0.2462286800146103,
+      "elapsed_s": 28.57744810730219,
+      "loading_s": 2.8492625746876,
+      "peak_memory_gib": 41.28215837478638,
+      "effective_batch": 256
+    }
+  ],
+  "steady_update_seconds": 28.620437198784202,
+  "steady_samples_per_second": 8.944657211975604,
+  "estimated_30000_updates_hours": 238.5036433232017,
+  "estimate_excludes": "startup, validation, checkpoint I/O, long-run variability",
+  "normalization": "QUANTILES from existing dataset metadata",
+  "validation_episodes": [
+    0,
+    17,
+    26,
+    34,
+    44
+  ],
+  "incomplete_micro_batch": "dropped at each epoch boundary",
+  "checkpoint_saved": false
+}

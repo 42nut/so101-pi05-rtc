@@ -1,0 +1,24 @@
+{
+  "source": "logs/pi05_dagger_334_20261023_233939.log",
+  "logged_updates": 402,
+  "last_logged_update": {
+    "update": 4000,
+    "loss": 0.0020313331715442473,
+    "grad_norm": 0.05418448522686958,
+    "elapsed_s": 20.87793011777103,
+    "loading_s": 3.070372747257352,
+    "peak_memory_gib": 59.093976974487305,
+    "effective_batch": 256,
+    "lr_used": 1.0000000000000002e-06,
+    "cumulative_update": 8000,
+    "group_samples": {
+      "base": 77,
+      "recovery": 77,
+      "dagger": 102
+    }
+  },
+  "real_robot_evaluation": "pending",
+  "cpu_training_tests": 5,
+  "cpu_rtc_tests": 8,
+  "gpu_validation_in_this_review": false
+}

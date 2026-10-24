@@ -1,0 +1,51 @@
+{
+  "status": "passed",
+  "lerobot_version": "0.6.1",
+  "native_trainer_sha256": "f2c2f33358951cede0ebc96604209c515d0daff26821867354feec81725bb4de",
+  "micro_batch": 8,
+  "accumulation_steps": 32,
+  "effective_batch": 256,
+  "updates": [
+    {
+      "update": 1,
+      "loss": 0.27290334179997444,
+      "grad_norm": 6.056722640991211,
+      "elapsed_s": 33.95902609266341,
+      "loading_s": 3.349412973970175,
+      "peak_memory_gib": 37.04653072357178,
+      "effective_batch": 256
+    },
+    {
+      "update": 2,
+      "loss": 0.11212403047829866,
+      "grad_norm": 0.6345846056938171,
+      "elapsed_s": 33.29452506452799,
+      "loading_s": 3.2022687401622534,
+      "peak_memory_gib": 37.086082458496094,
+      "effective_batch": 256
+    },
+    {
+      "update": 3,
+      "loss": 0.09379170462489128,
+      "grad_norm": 0.3966084420681,
+      "elapsed_s": 33.1938891466707,
+      "loading_s": 3.1845256686210632,
+      "peak_memory_gib": 37.086082458496094,
+      "effective_batch": 256
+    }
+  ],
+  "steady_update_seconds": 33.244207105599344,
+  "steady_samples_per_second": 7.700589735433388,
+  "estimated_30000_updates_hours": 277.0350592133279,
+  "estimate_excludes": "startup, validation, checkpoint I/O, long-run variability",
+  "normalization": "QUANTILES from existing dataset metadata",
+  "validation_episodes": [
+    0,
+    17,
+    26,
+    34,
+    44
+  ],
+  "incomplete_micro_batch": "dropped at each epoch boundary",
+  "checkpoint_saved": false
+}

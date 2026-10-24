@@ -1,0 +1,5 @@
+{
+  "threshold": "both action and state per-frame max absolute changes <0.05 for >=3 seconds",
+  "limitation": "Heuristic in recorded units, not evidence of bad demonstrations; no cuts applied",
+  "candidates": []
+}

@@ -1,0 +1,261 @@
+{
+  "status": "passed",
+  "dataset_root": "/root/autodl-tmp/pi05/datasets/work/so101_yellow_cube_to_tray_v21",
+  "repo_id": "local/so101_yellow_cube_to_tray",
+  "normalization": "QUANTILES",
+  "action_representation": "absolute recorded motor positions",
+  "normalization_fit_episodes": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    45,
+    46,
+    47,
+    48,
+    49
+  ],
+  "validation_episodes": [
+    0,
+    17,
+    26,
+    34,
+    44
+  ],
+  "train_frames": 28083,
+  "validation_frames": 2886,
+  "action_chunk_size": 50,
+  "fps": 30,
+  "sample_checks": [
+    {
+      "split": "train",
+      "dataset_row": 0,
+      "episode_index": 1,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -0.9951121807098389,
+        "normalized_max": 0.326122522354126,
+        "roundtrip_max_error": 3.814697265625e-06
+      },
+      "observation.state": {
+        "normalized_min": -0.9914529919624329,
+        "normalized_max": 0.4122025966644287,
+        "roundtrip_max_error": 3.814697265625e-06
+      }
+    },
+    {
+      "split": "train",
+      "dataset_row": 14041,
+      "episode_index": 24,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -1.5227930545806885,
+        "normalized_max": 0.921911358833313,
+        "roundtrip_max_error": 7.62939453125e-06
+      },
+      "observation.state": {
+        "normalized_min": -1.3973920345306396,
+        "normalized_max": 0.9413524866104126,
+        "roundtrip_max_error": 7.62939453125e-06
+      }
+    },
+    {
+      "split": "train",
+      "dataset_row": 28082,
+      "episode_index": 49,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -1.0,
+        "normalized_max": 0.8566433191299438,
+        "roundtrip_max_error": 9.5367431640625e-07
+      },
+      "observation.state": {
+        "normalized_min": -0.9957265257835388,
+        "normalized_max": 0.8491920232772827,
+        "roundtrip_max_error": 4.76837158203125e-06
+      }
+    },
+    {
+      "split": "validation",
+      "dataset_row": 0,
+      "episode_index": 0,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -1.0,
+        "normalized_max": 1.0011656284332275,
+        "roundtrip_max_error": 7.62939453125e-06
+      },
+      "observation.state": {
+        "normalized_min": -0.9921267628669739,
+        "normalized_max": 1.0,
+        "roundtrip_max_error": 7.62939453125e-06
+      }
+    },
+    {
+      "split": "validation",
+      "dataset_row": 1443,
+      "episode_index": 26,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -0.4574514627456665,
+        "normalized_max": 1.0206584930419922,
+        "roundtrip_max_error": 1.1444091796875e-05
+      },
+      "observation.state": {
+        "normalized_min": -0.33572715520858765,
+        "normalized_max": 1.0442132949829102,
+        "roundtrip_max_error": 3.814697265625e-06
+      }
+    },
+    {
+      "split": "validation",
+      "dataset_row": 2885,
+      "episode_index": 44,
+      "action_shape": [
+        1,
+        50,
+        6
+      ],
+      "images": {
+        "observation.images.front": [
+          3,
+          480,
+          640
+        ],
+        "observation.images.wrist": [
+          3,
+          480,
+          640
+        ]
+      },
+      "action": {
+        "normalized_min": -0.9951121807098389,
+        "normalized_max": 0.9688544273376465,
+        "roundtrip_max_error": 5.7220458984375e-06
+      },
+      "observation.state": {
+        "normalized_min": -0.9914529919624329,
+        "normalized_max": 0.9820321798324585,
+        "roundtrip_max_error": 3.814697265625e-06
+      }
+    }
+  ],
+  "normalization_stats_sha256": "c481354877b8c671c911274376333d6d6ec0b70925d934e5f240537ffd288e52",
+  "scope": "Checks native decoding, exact episode selection and numeric normalization; model/tokenizer/resize not checked"
+}

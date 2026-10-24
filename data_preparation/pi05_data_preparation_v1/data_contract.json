@@ -1,0 +1,79 @@
+{
+  "status": "split and numeric statistics prepared; training format conversion not yet performed",
+  "source_format": "v2.1",
+  "fps": 30.0,
+  "cameras": {
+    "observation.images.front": {
+      "shape": [
+        480,
+        640,
+        3
+      ],
+      "info": {
+        "video.height": 480,
+        "video.width": 640,
+        "video.codec": "av1",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "video.fps": 30,
+        "video.channels": 3,
+        "has_audio": false
+      }
+    },
+    "observation.images.wrist": {
+      "shape": [
+        480,
+        640,
+        3
+      ],
+      "info": {
+        "video.height": 480,
+        "video.width": 640,
+        "video.codec": "av1",
+        "video.pix_fmt": "yuv420p",
+        "video.is_depth_map": false,
+        "video.fps": 30,
+        "video.channels": 3,
+        "has_audio": false
+      }
+    }
+  },
+  "state_names": [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos"
+  ],
+  "action_names": [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos"
+  ],
+  "task_records": [
+    {
+      "task_index": 0,
+      "task": "Pick up the yellow cube from inside the black outlined area and place it in the gray-blue tray."
+    }
+  ],
+  "action_semantics": "absolute motor position targets in original LeRobot normalized units; verify deployment config matches recording",
+  "preserve": [
+    "30 FPS",
+    "6 recorded action dimensions",
+    "all original frames",
+    "all original videos",
+    "episode boundaries"
+  ],
+  "pending": [
+    "pin Pi05-capable training environment",
+    "convert a copy to training-supported dataset format",
+    "apply split in actual loader",
+    "attach train-only normalization statistics with compatible schema",
+    "verify camera mapping and train/inference processors",
+    "load one real batch before training"
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "status": "passed",
+  "lerobot_version": "0.6.1",
+  "gradient_checkpointing": false,
+  "native_trainer_sha256": "f2c2f33358951cede0ebc96604209c515d0daff26821867354feec81725bb4de",
+  "micro_batch": 8,
+  "accumulation_steps": 32,
+  "effective_batch": 256,
+  "updates": [
+    {
+      "update": 1,
+      "loss": 0.27290334179997444,
+      "grad_norm": 6.056719779968262,
+      "elapsed_s": 21.560802593827248,
+      "loading_s": 3.3237718138843775,
+      "peak_memory_gib": 44.991722106933594,
+      "effective_batch": 256
+    },
+    {
+      "update": 2,
+      "loss": 0.112108682282269,
+      "grad_norm": 0.6347695589065552,
+      "elapsed_s": 20.962486369535327,
+      "loading_s": 3.20507550239563,
+      "peak_memory_gib": 59.13126993179321,
+      "effective_batch": 256
+    },
+    {
+      "update": 3,
+      "loss": 0.0952917376998812,
+      "grad_norm": 0.4284683167934418,
+      "elapsed_s": 20.951474584639072,
+      "loading_s": 3.157965609803796,
+      "peak_memory_gib": 59.103907108306885,
+      "effective_batch": 256
+    },
+    {
+      "update": 4,
+      "loss": 0.08485274843405932,
+      "grad_norm": 0.2951740026473999,
+      "elapsed_s": 21.041112698614597,
+      "loading_s": 3.1765486150979996,
+      "peak_memory_gib": 59.103907108306885,
+      "effective_batch": 256
+    },
+    {
+      "update": 5,
+      "loss": 0.073695347760804,
+      "grad_norm": 0.23376062512397766,
+      "elapsed_s": 21.170423485338688,
+      "loading_s": 3.1284409817308187,
+      "peak_memory_gib": 59.103907108306885,
+      "effective_batch": 256
+    }
+  ],
+  "steady_update_seconds": 21.03137428453192,
+  "steady_samples_per_second": 12.17229062336083,
+  "estimated_30000_updates_hours": 175.26145237109935,
+  "estimate_excludes": "startup, validation, checkpoint I/O, long-run variability",
+  "normalization": "QUANTILES from existing dataset metadata",
+  "validation_episodes": [
+    0,
+    17,
+    26,
+    34,
+    44
+  ],
+  "incomplete_micro_batch": "dropped at each epoch boundary",
+  "checkpoint_saved": false
+}

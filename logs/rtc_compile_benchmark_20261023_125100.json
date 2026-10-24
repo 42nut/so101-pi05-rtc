@@ -1,0 +1,115 @@
+{
+  "checkpoint": "/root/autodl-tmp/pi05/outputs/pi05_recovery_cosine_tc_v1/checkpoints/002000/pretrained_model",
+  "compile_target": "denoise_step",
+  "compile_mode": "default",
+  "parity_passed": false,
+  "errors": [
+    {
+      "frame": 0,
+      "delay": 12,
+      "normalized_mae": 0.0003373374929651618,
+      "normalized_max": 0.0028914213180541992,
+      "joint_max": 0.15715789794921875,
+      "passed": false
+    },
+    {
+      "frame": 0,
+      "delay": 18,
+      "normalized_mae": 0.0003257956705056131,
+      "normalized_max": 0.0022739768028259277,
+      "joint_max": 0.1161651611328125,
+      "passed": false
+    },
+    {
+      "frame": 0,
+      "delay": 24,
+      "normalized_mae": 0.00030270073330029845,
+      "normalized_max": 0.0019208788871765137,
+      "joint_max": 0.128692626953125,
+      "passed": false
+    },
+    {
+      "frame": 1,
+      "delay": 12,
+      "normalized_mae": 0.00027482627774588764,
+      "normalized_max": 0.0020845532417297363,
+      "joint_max": 0.12762451171875,
+      "passed": false
+    },
+    {
+      "frame": 1,
+      "delay": 18,
+      "normalized_mae": 0.00024369492894038558,
+      "normalized_max": 0.0016270875930786133,
+      "joint_max": 0.101715087890625,
+      "passed": false
+    },
+    {
+      "frame": 1,
+      "delay": 24,
+      "normalized_mae": 0.00024505375768058,
+      "normalized_max": 0.002005279064178467,
+      "joint_max": 0.122772216796875,
+      "passed": false
+    },
+    {
+      "frame": 2,
+      "delay": 12,
+      "normalized_mae": 0.00029436100157909095,
+      "normalized_max": 0.0019699931144714355,
+      "joint_max": 0.10227203369140625,
+      "passed": false
+    },
+    {
+      "frame": 2,
+      "delay": 18,
+      "normalized_mae": 0.0002766873803921044,
+      "normalized_max": 0.00168541818857193,
+      "joint_max": 0.10310745239257812,
+      "passed": false
+    },
+    {
+      "frame": 2,
+      "delay": 24,
+      "normalized_mae": 0.0002465868601575494,
+      "normalized_max": 0.0016883611679077148,
+      "joint_max": 0.11124801635742188,
+      "passed": false
+    }
+  ],
+  "eager_median_ms": 320.80474868416786,
+  "compiled_median_ms": 145.40072064846754,
+  "speedup": 2.2063490968505666,
+  "eager_samples_ms": [
+    322.11981527507305,
+    321.5858731418848,
+    321.87931053340435,
+    320.5341752618551,
+    320.7399472594261,
+    320.80474868416786,
+    320.5620553344488,
+    320.36601193249226,
+    322.9864574968815
+  ],
+  "compiled_samples_ms": [
+    146.0720021277666,
+    145.98339051008224,
+    145.1798677444458,
+    145.0161151587963,
+    145.69861628115177,
+    145.7248590886593,
+    145.26502415537834,
+    146.44702337682247,
+    146.29478380084038,
+    145.65622806549072,
+    145.21330781280994,
+    145.14056593179703,
+    145.3207228332758,
+    144.7578389197588,
+    145.6642672419548,
+    145.2057920396328,
+    145.4807184636593,
+    145.12888342142105
+  ],
+  "integration_candidate": false
+}

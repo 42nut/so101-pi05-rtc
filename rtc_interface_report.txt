@@ -1,0 +1,2223 @@
+=== LeRobot version ===
+0.6.1
+
+=== PI05Config ===
+@PreTrainedConfig.register_subclass("pi05")
+@dataclass
+class PI05Config(PreTrainedConfig):
+    paligemma_variant: str = "gemma_2b"
+    action_expert_variant: str = "gemma_300m"
+    dtype: str = "float32"  # Options: "bfloat16", "float32"
+
+    n_obs_steps: int = 1
+    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
+    n_action_steps: int = 50  # Number of action steps to execute
+
+    # Shorter state and action vectors will be padded to these dimensions
+    max_state_dim: int = 32
+    max_action_dim: int = 32
+
+    # Flow matching parameters: see openpi `PI0Pytorch`
+    num_inference_steps: int = 10
+    time_sampling_beta_alpha: float = 1.5
+    time_sampling_beta_beta: float = 1.0
+    time_sampling_scale: float = 0.999
+    time_sampling_offset: float = 0.001
+    min_period: float = 4e-3
+    max_period: float = 4.0
+
+    # Relative actions: converts absolute actions to relative (relative to state).
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
+
+    # Real-Time Chunking (RTC) configuration
+    rtc_config: RTCConfig | None = None
+
+    image_resolution: tuple[int, int] = (
+        DEFAULT_IMAGE_SIZE,
+        DEFAULT_IMAGE_SIZE,
+    )  # see openpi `preprocessing_pytorch.py`
+
+    # Add empty images. Used to add empty cameras when no image features are present.
+    empty_cameras: int = 0
+
+    tokenizer_max_length: int = 200  # see openpi `__post_init__`
+
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.QUANTILES,  # Pi0.5 uses quantiles for state
+            "ACTION": NormalizationMode.QUANTILES,  # Pi0.5 uses quantiles for action
+        }
+    )
+
+    # Training settings
+    gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
+    compile_model: bool = False  # Whether to use torch.compile for model optimization
+    compile_mode: str = "max-autotune"  # Torch compile mode
+    device: str | None = None  # Device to use for the model (None = auto-detect)
+
+    # Finetuning settings
+    freeze_vision_encoder: bool = False  # Freeze only the vision encoder
+    train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+
+    # Optimizer settings: see openpi `AdamW`
+    optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
+    optimizer_betas: tuple[float, float] = (0.9, 0.95)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 0.01
+    optimizer_grad_clip_norm: float = 1.0
+
+    # Scheduler settings: see openpi `CosineDecaySchedule`
+    # Note: These will auto-scale if --steps < scheduler_decay_steps
+    # For example, --steps=3000 will scale warmup to 100 and decay to 3000
+    scheduler_warmup_steps: int = 1_000
+    scheduler_decay_steps: int = 30_000
+    scheduler_decay_lr: float = 2.5e-6
+
+    tokenizer_max_length: int = 200  # see openpi `__post_init__`
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Validate configuration
+        if self.n_action_steps > self.chunk_size:
+            raise ValueError(
+                f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
+            )
+
+        if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
+            raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
+
+        if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
+            raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
+
+        if self.dtype not in ["bfloat16", "float32"]:
+            raise ValueError(f"Invalid dtype: {self.dtype}")
+
+    def validate_features(self) -> None:
+        """Validate and set up input/output features."""
+        for i in range(self.empty_cameras):
+            key = OBS_IMAGES + f".empty_camera_{i}"
+            empty_camera = PolicyFeature(
+                type=FeatureType.VISUAL,
+                shape=(3, *self.image_resolution),  # Use configured image resolution
+            )
+            self.input_features[key] = empty_camera
+
+        if OBS_STATE not in self.input_features:
+            state_feature = PolicyFeature(
+                type=FeatureType.STATE,
+                shape=(self.max_state_dim,),  # Padded to max_state_dim
+            )
+            self.input_features[OBS_STATE] = state_feature
+
+        if ACTION not in self.output_features:
+            action_feature = PolicyFeature(
+                type=FeatureType.ACTION,
+                shape=(self.max_action_dim,),  # Padded to max_action_dim
+            )
+            self.output_features[ACTION] = action_feature
+
+    def get_optimizer_preset(self) -> AdamWConfig:
+        return AdamWConfig(
+            lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
+            weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=self.optimizer_grad_clip_norm,
+        )
+
+    def get_scheduler_preset(self):
+        return CosineDecayWithWarmupSchedulerConfig(
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.scheduler_decay_lr,
+            num_warmup_steps=self.scheduler_warmup_steps,
+            num_decay_steps=self.scheduler_decay_steps,
+        )
+
+    @property
+    def observation_delta_indices(self) -> None:
+        return None
+
+    @property
+    def action_delta_indices(self) -> list:
+        return list(range(self.chunk_size))
+
+    @property
+    def reward_delta_indices(self) -> None:
+        return None
+
+
+=== predict_action_chunk ===
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+        """Predict a chunk of actions given environment observations."""
+        self.eval()
+
+        # Prepare inputs
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+
+        # Unpad actions to actual action dimension
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        actions = actions[:, :, :original_action_dim]
+
+        return actions
+
+
+=== PI05 RTC integration ===
+
+...
+52: )
+53: 
+54: from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
+55: from ..common.vla_utils import (
+56:     clone_past_key_values,
+57:     create_sinusoidal_pos_embedding,
+58:     make_att_2d_masks,
+59:     pad_vector,
+60:     prepare_attention_masks_4d,
+61:     resize_with_pad_torch,
+62: )
+63: from ..pretrained import PreTrainedPolicy, T
+64: from ..rtc.modeling_rtc import RTCProcessor
+65: from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+66: 
+67: 
+68: class ActionSelectKwargs(TypedDict, total=False):
+69:     inference_delay: int | None
+70:     prev_chunk_left_over: Tensor | None
+71:     execution_horizon: int | None
+72: 
+73: 
+74: # Define the complete layer computation function for gradient checkpointing
+75: def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
+76:     query_states = []
+77:     key_states = []
+78:     value_states = []
+79:     gates = []
+80:     for i, hidden_states in enumerate(inputs_embeds):
+81:         layer = layers[i]
+82:         hidden_states, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond[i])
+83:         gates.append(gate)
+84:         input_shape = hidden_states.shape[:-1]
+85:         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+86:         query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+87:         key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+88:         value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+89:         query_states.append(query_state)
+90:         key_states.append(key_state)
+91:         value_states.append(value_state)
+92:     # Concatenate and process attention
+93:     query_states = torch.cat(query_states, dim=2)
+94:     key_states = torch.cat(key_states, dim=2)
+95:     value_states = torch.cat(value_states, dim=2)
+96:     dummy_tensor = torch.zeros(
+97:         query_states.shape[0],
+98:         query_states.shape[2],
+99:         query_states.shape[-1],
+100:         device=query_states.device,
+
+...
+392:                 outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+393: 
+394:             prefix_output = outputs_embeds[0]
+395:             suffix_output = outputs_embeds[1]
+396:             prefix_past_key_values = None
+397: 
+398:         return [prefix_output, suffix_output], prefix_past_key_values
+399: 
+400: 
+401: class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
+402:     """Core PI05 PyTorch model."""
+403: 
+404:     def __init__(self, config: PI05Config, rtc_processor: RTCProcessor | None = None):
+405:         super().__init__()
+406:         self.config = config
+407:         self.rtc_processor = rtc_processor
+408: 
+409:         paligemma_config = get_gemma_config(config.paligemma_variant)
+410:         action_expert_config = get_gemma_config(config.action_expert_variant)
+411: 
+412:         if config.image_resolution[0] != config.image_resolution[1]:
+413:             raise ValueError(
+414:                 f"PaliGemma expects square image resolution, invalid resolution: {config.image_resolution}"
+415:             )
+416: 
+417:         self.paligemma_with_expert = PaliGemmaWithExpertModel(
+418:             paligemma_config,
+419:             action_expert_config,
+420:             use_adarms=[False, True],
+421:             precision=config.dtype,
+422:             image_size=config.image_resolution[0],
+423:             freeze_vision_encoder=config.freeze_vision_encoder,
+424:             train_expert_only=config.train_expert_only,
+425:         )
+426: 
+427:         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+428:         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+429: 
+430:         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
+431:         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+432: 
+433:         # Initialize gradient checkpointing flag
+434:         self.gradient_checkpointing_enabled = False
+435: 
+436:         # Compile model if requested
+
+...
+447:         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
+448:         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+449:         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
+450: 
+451:     def gradient_checkpointing_disable(self):
+452:         """Disable gradient checkpointing."""
+453:         self.gradient_checkpointing_enabled = False
+454:         self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
+455:         self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
+456:         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+457:         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
+458: 
+459:     def _rtc_enabled(self):
+460:         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+461: 
+462:     def _apply_checkpoint(self, func, *args, **kwargs):
+463:         """Helper method to apply gradient checkpointing if enabled."""
+464:         if self.gradient_checkpointing_enabled and self.training:
+465:             return torch.utils.checkpoint.checkpoint(
+466:                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+467:             )
+468:         return func(*args, **kwargs)
+469: 
+470:     def sample_noise(self, shape, device):
+471:         return sample_noise(shape, device)
+472: 
+473:     def sample_time(self, bsize, device):
+474:         return sample_time_beta(
+475:             bsize,
+476:             device,
+477:             alpha=self.config.time_sampling_beta_alpha,
+478:             beta=self.config.time_sampling_beta_beta,
+479:             scale=self.config.time_sampling_scale,
+480:             offset=self.config.time_sampling_offset,
+481:         )
+482: 
+483:     def embed_prefix(
+484:         self, images, img_masks, tokens, masks
+485:     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+486:         """Embed images with SigLIP and language tokens with embedding layer."""
+487:         embs = []
+488:         pad_masks = []
+489:         att_masks = []
+
+...
+652:             use_cache=True,
+653:         )
+654: 
+655:         return euler_integrate(
+656:             lambda input_x_t, current_timestep: self.denoise_step(
+657:                 prefix_pad_masks=prefix_pad_masks,
+658:                 past_key_values=past_key_values,
+659:                 x_t=input_x_t,
+660:                 timestep=current_timestep,
+661:             ),
+662:             noise,
+663:             num_steps,
+664:             rtc_processor=self.rtc_processor,
+665:             rtc_enabled=self._rtc_enabled(),
+666:             inference_delay=kwargs.get("inference_delay"),
+667:             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
+668:             execution_horizon=kwargs.get("execution_horizon"),
+669:         )
+670: 
+671:     def denoise_step(
+672:         self,
+673:         prefix_pad_masks,
+674:         past_key_values,
+675:         x_t,
+676:         timestep,
+677:     ):
+678:         """Apply one denoising step of the noise `x_t` at a given timestep."""
+679:         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+680: 
+681:         suffix_len = suffix_pad_masks.shape[1]
+682:         batch_size = prefix_pad_masks.shape[0]
+683:         prefix_len = prefix_pad_masks.shape[1]
+684: 
+685:         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+686:         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+687:         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+688: 
+689:         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+690:         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+691: 
+692:         full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
+693:         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+694: 
+695:         past_key_values = clone_past_key_values(past_key_values)
+696:         outputs_embeds, _ = self.paligemma_with_expert.forward(
+697:             attention_mask=full_att_2d_masks_4d,
+
+...
+705:         suffix_out = outputs_embeds[1]
+706:         suffix_out = suffix_out[:, -self.config.chunk_size :]
+707:         suffix_out = suffix_out.to(dtype=torch.float32)
+708:         return self.action_out_proj(suffix_out)
+709: 
+710: 
+711: class PI05Policy(PreTrainedPolicy):
+712:     """PI05 Policy for LeRobot."""
+713: 
+714:     config_class = PI05Config
+715:     name = "pi05"
+716: 
+717:     def supports_rtc(self) -> bool:
+718:         return True
+719: 
+720:     def __init__(
+721:         self,
+722:         config: PI05Config,
+723:         **kwargs,
+724:     ):
+725:         """
+726:         Args:
+727:             config: Policy configuration class instance.
+728:         """
+729:         require_package("transformers", extra="pi")
+730:         super().__init__(config)
+731:         config.validate_features()
+732:         self.config = config
+733: 
+734:         # Initialize the core PI05 model
+735:         self.init_rtc_processor()
+736:         self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
+737: 
+738:         # Enable gradient checkpointing if requested
+739:         if config.gradient_checkpointing:
+740:             self.model.gradient_checkpointing_enable()
+741: 
+742:         self.model.to(config.device)
+743: 
+744:         self.reset()
+745: 
+746:     @classmethod
+747:     def from_pretrained(
+748:         cls: builtins.type[T],
+749:         pretrained_name_or_path: str | Path,
+750:         *,
+751:         config: PreTrainedConfig | None = None,
+752:         force_download: bool = False,
+753:         resume_download: bool | None = None,
+754:         proxies: dict | None = None,
+755:         token: str | bool | None = None,
+756:         cache_dir: str | Path | None = None,
+757:         local_files_only: bool = False,
+758:         revision: str | None = None,
+759:         strict: bool = True,
+760:         **kwargs,
+761:     ) -> T:
+762:         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+763:         print(
+764:             "The PI05 model is a direct port of the OpenPI implementation. \n"
+765:             "This implementation follows the original OpenPI structure for compatibility. \n"
+
+...
+924:         return fixed_state_dict
+925: 
+926:     def get_optim_params(self) -> dict:
+927:         return self.parameters()
+928: 
+929:     def reset(self):
+930:         """Reset internal state - called when environment resets."""
+931:         self._action_queue = deque(maxlen=self.config.n_action_steps)
+932:         self._queues = {
+933:             ACTION: deque(maxlen=self.config.n_action_steps),
+934:         }
+935: 
+936:     def init_rtc_processor(self):
+937:         """Initialize RTC processor if RTC is enabled in config."""
+938:         self.rtc_processor = None
+939: 
+940:         # Create processor if config provided
+941:         # If RTC is not enabled - we can still track the denoising data
+942:         if self.config.rtc_config is not None:
+943:             self.rtc_processor = RTCProcessor(self.config.rtc_config)
+944: 
+945:             model_value = getattr(self, "model", None)
+946:             if model_value is not None:
+947:                 model_value.rtc_processor = self.rtc_processor
+948: 
+949:     def _rtc_enabled(self) -> bool:
+950:         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+951: 
+952:     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+953:         """Preprocess images for the model.
+954: 
+955:         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+956:         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+957:         """
+958:         images = []
+959:         img_masks = []
+960: 
+961:         # Get device from model parameters
+962:         device = next(self.parameters()).device
+963: 
+964:         present_img_keys = [key for key in self.config.image_features if key in batch]
+965:         missing_img_keys = [key for key in self.config.image_features if key not in batch]
+966: 
+967:         if len(present_img_keys) == 0:
+968:             raise ValueError(
+969:                 f"All image features are missing from the batch. At least one expected. "
+970:                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
+971:             )
+972: 
+973:         # Preprocess image features present in the batch
+974:         for key in present_img_keys:
+975:             img = batch[key]
+976: 
+977:             # Ensure tensor is on the same device as the model
+978:             if img.device != device:
+979:                 img = img.to(device)
+
+...
+1014:             img_masks.append(mask)
+1015: 
+1016:         return images, img_masks
+1017: 
+1018:     def prepare_action(self, batch):
+1019:         """Pad action"""
+1020:         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+1021:         return actions
+1022: 
+1023:     @torch.no_grad()
+1024:     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+1025:         """Select a single action given environment observations."""
+1026:         assert not self._rtc_enabled(), (
+1027:             "RTC is not supported for select_action, use it with predict_action_chunk"
+1028:         )
+1029: 
+1030:         self.eval()
+1031: 
+1032:         # Action queue logic for n_action_steps > 1
+1033:         if len(self._action_queue) == 0:
+1034:             actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+1035:             # Transpose to get shape (n_action_steps, batch_size, action_dim)
+1036:             self._action_queue.extend(actions.transpose(0, 1))
+1037: 
+1038:         return self._action_queue.popleft()
+1039: 
+1040:     @torch.no_grad()
+1041:     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
+1042:         """Predict a chunk of actions given environment observations."""
+1043:         self.eval()
+1044: 
+1045:         # Prepare inputs
+1046:         images, img_masks = self._preprocess_images(batch)
+1047:         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+1048: 
+1049:         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
+1050:         actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+1051: 
+1052:         # Unpad actions to actual action dimension
+1053:         original_action_dim = self.config.output_features[ACTION].shape[0]
+1054:         actions = actions[:, :, :original_action_dim]
+1055: 
+1056:         return actions
+1057: 
+1058:     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+1059:         """Run the batch through the model and compute the loss for training.
+1060: 
+1061:         Args:
+1062:             batch: Training batch containing observations and actions.
+1063:             reduction: How to reduce the loss. Options:
+1064:                 - "mean": Return scalar mean loss (default, backward compatible)
+1065:                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
+1066:         """
+1067:         # Prepare inputs
+1068:         images, img_masks = self._preprocess_images(batch)
+1069:         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+1070: 
+1071:         actions = self.prepare_action(batch)
+1072: 
+1073:         noise = self.model.sample_noise(actions.shape, actions.device)
+1074:         time = self.model.sample_time(actions.shape[0], actions.device)
+1075: 
+1076:         # Compute loss (no separate state needed for PI05)
+1077:         losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+1078: 
+
+=== RTC implementation files ===
+
+--- policies/rtc/__init__.py ---
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Real-Time Chunking (RTC) utilities for action-chunking policies."""
+
+from .action_interpolator import ActionInterpolator
+from .action_queue import ActionQueue
+from .configuration_rtc import RTCConfig
+from .latency_tracker import LatencyTracker
+from .modeling_rtc import RTCProcessor
+from .relative import reanchor_relative_rtc_prefix
+
+__all__ = [
+    "ActionInterpolator",
+    "ActionQueue",
+    "LatencyTracker",
+    "RTCConfig",
+    "RTCProcessor",
+    "reanchor_relative_rtc_prefix",
+]
+
+
+--- policies/rtc/action_interpolator.py ---
+# Moved to lerobot.utils.action_interpolator — re-exported for backwards compatibility.
+from lerobot.utils.action_interpolator import ActionInterpolator
+
+__all__ = ["ActionInterpolator"]
+
+
+--- policies/rtc/action_queue.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Action queue management for Real-Time Chunking (RTC).
+
+This module provides ActionQueue, a thread-safe queue for managing action chunks
+in real-time control scenarios. It supports both RTC-enabled and non-RTC modes,
+handling action merging and leftover tracking.
+"""
+
+import logging
+from threading import Lock
+
+import torch
+from torch import Tensor
+
+from .configuration_rtc import RTCConfig
+
+logger = logging.getLogger(__name__)
+
+
+class ActionQueue:
+    """Thread-safe queue for managing action chunks in real-time control.
+
+    This queue handles two types of action sequences:
+    - Original actions: Used for RTC to compute leftovers from previous chunks
+    - Processed actions: Post-processed actions ready for robot execution
+
+    The queue operates in two modes:
+    1. RTC-enabled: Replaces the entire queue with new actions, accounting for inference delay
+    2. RTC-disabled: Appends new actions to the queue, maintaining continuity
+
+    Args:
+        cfg (RTCConfig): Configuration for Real-Time Chunking behavior.
+
+    Attributes:
+        queue (Tensor | None): Processed actions for robot rollout (time_steps, action_dim).
+        original_queue (Tensor | None): Original actions for RTC computation (time_steps, action_dim).
+        last_index (int): Current consumption index in the queue.
+    """
+
+    def __init__(self, cfg: RTCConfig):
+        """Initialize the action queue.
+
+        Args:
+            cfg: RTC configuration controlling queue behavior.
+        """
+        self.queue = None  # Processed actions for robot rollout
+        self.original_queue = None  # Original actions for RTC
+        self.lock = Lock()
+        self.last_index = 0
+        self.cfg = cfg
+
+    def get(self) -> Tensor | None:
+        """Get the next action from the queue.
+
+        Returns:
+            Tensor | None: The next action (action_dim,) or None if queue is empty.
+                          Returns a clone to prevent external modifications.
+        """
+        with self.lock:
+            if self.queue is None or self.last_index >= len(self.queue):
+                return None
+
+            action = self.queue[self.last_index]
+            self.last_index += 1
+            return action.clone()
+
+    def clear(self) -> None:
+        """Clear queued actions and reset consumption index."""
+        with self.lock:
+            self.queue = None
+            self.original_queue = None
+            self.last_index = 0
+
+    def qsize(self) -> int:
+        """Get the number of remaining actions in the queue.
+
+        Returns:
+            int: Number of unconsumed actions.
+        """
+        with self.lock:
+            if self.queue is None:
+                return 0
+            return len(self.queue) - self.last_index
+
+    def empty(self) -> bool:
+        """Check if the queue is empty.
+
+        Returns:
+            bool: True if no actions remain, False otherwise.
+        """
+        with self.lock:
+            if self.queue is None:
+                return True
+            return len(self.queue) - self.last_index <= 0
+
+    def get_action_index(self) -> int:
+        """Get the current action consumption index.
+
+        Returns:
+            int: Index of the next action to be consumed.
+        """
+        with self.lock:
+            return self.last_index
+
+    def get_left_over(self) -> Tensor | None:
+        """Get leftover original actions for RTC prev_chunk_left_over.
+
+        These are the unconsumed actions from the current chunk, which will be
+        used by RTC to compute corrections for the next chunk.
+
+        Returns:
+            Tensor | None: Remaining original actions (remaining_steps, action_dim),
+                          or None if no original queue exists.
+        """
+        with self.lock:
+            if self.original_queue is None:
+                return None
+            return self.original_queue[self.last_index :].clone()
+
+    def get_processed_left_over(self) -> Tensor | None:
+        """Get leftover processed actions (the actions currently executed by the robot).
+
+        Returns:
+            Tensor | None: Remaining processed actions (remaining_steps, action_dim),
+                or None if no processed queue exists.
+        """
+        with self.lock:
+            if self.queue is None:
+                return None
+            return self.queue[self.last_index :].clone()
+
+    def merge(
+        self,
+        original_actions: Tensor,
+        processed_actions: Tensor,
+        real_delay: int,
+        action_index_before_inference: int | None = None,
+    ):
+        """Merge new actions into the queue.
+
+        This method operates differently based on RTC mode:
+        - RTC enabled: Replaces the queue, accounting for inference delay
+        - RTC disabled: Appends to the queue, maintaining continuity
+
+        Args:
+            original_actions: Unprocessed actions from policy (time_steps, action_dim).
+            processed_actions: Post-processed actions for robot (time_steps, action_dim).
+            real_delay: Number of time steps of inference delay.
+            action_index_before_inference: Index before inference started, for validation.
+        """
+        with self.lock:
+            delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
+
+            if self.cfg.enabled:
+                self._replace_actions_queue(original_actions, processed_actions, delay)
+                return
+
+            self._append_actions_queue(original_actions, processed_actions)
+
+    def _replace_actions_queue(self, original_actions: Tensor, processed_actions: Tensor, real_delay: int):
+        """Replace the queue with new actions (RTC mode).
+
+        Discards the first `real_delay` actions since they correspond to the time
+        spent during inference, when the robot was executing previous actions.
+
+        Args:
+            original_actions: Unprocessed actions from policy.
+            processed_actions: Post-processed actions for robot.
+            real_delay: Number of time steps to skip due to inference delay.
+        """
+        clamped_delay = max(0, min(real_delay, len(original_actions), len(processed_actions)))
+        self.original_queue = original_actions[clamped_delay:].clone()
+        self.queue = processed_actions[clamped_delay:].clone()
+
+        logger.debug(f"original_actions shape: {self.original_queue.shape}")
+        logger.debug(f"processed_actions shape: {self.queue.shape}")
+        logger.debug(f"real_delay: {real_delay}, clamped_delay: {clamped_delay}")
+
+        self.last_index = 0
+
+    def _append_actions_queue(self, original_actions: Tensor, processed_actions: Tensor):
+        """Append new actions to the queue (non-RTC mode).
+
+        Removes already-consumed actions and appends new ones, maintaining
+        queue continuity without replacement.
+
+        Args:
+            original_actions: Unprocessed actions from policy.
+            processed_actions: Post-processed actions for robot.
+        """
+        if self.queue is None:
+            self.original_queue = original_actions.clone()
+            self.queue = processed_actions.clone()
+            return
+
+        self.original_queue = torch.cat([self.original_queue, original_actions.clone()])
+        self.original_queue = self.original_queue[self.last_index :]
+
+        self.queue = torch.cat([self.queue, processed_actions.clone()])
+        self.queue = self.queue[self.last_index :]
+
+        self.last_index = 0
+
+    def _check_and_resolve_delays(
+        self, real_delay: int, action_index_before_inference: int | None = None
+    ) -> int:
+        """Validate that computed delays match expectations.
+
+        Compares the delay computed from inference latency with the actual
+        number of actions consumed during inference.
+
+        Args:
+            real_delay: Delay computed from inference latency.
+            action_index_before_inference: Action index when inference started.
+
+        Returns:
+            int: Delay to use.
+        """
+        effective_delay = max(0, real_delay)
+
+        if action_index_before_inference is not None:
+            indexes_diff = max(0, self.last_index - action_index_before_inference)
+            if indexes_diff != real_delay:
+                logger.warning(
+                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
+                    indexes_diff,
+                    real_delay,
+                )
+                return real_delay
+
+        return effective_delay
+
+
+--- policies/rtc/configuration_rtc.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Real Time Chunking (RTC) and Bidirectional Decoding (BID) configuration classes.
+
+Based on:
+- Real Time Chunking: https://www.physicalintelligence.company/research/real_time_chunking
+"""
+
+from dataclasses import dataclass
+
+from lerobot.configs import RTCAttentionSchedule
+
+
+@dataclass
+class RTCConfig:
+    """Configuration for Real Time Chunking (RTC) inference.
+
+    RTC improves real-time inference by treating chunk generation as an inpainting problem,
+    strategically handling overlapping timesteps between action chunks using prefix attention.
+    """
+
+    # Infrastructure
+    enabled: bool = True
+
+    # Core RTC settings
+    # Todo change to exp
+    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+    max_guidance_weight: float = 10.0
+    execution_horizon: int = 10
+
+    # Debug settings
+    debug: bool = False
+    debug_maxlen: int = 100
+
+    def __post_init__(self):
+        """Validate RTC configuration parameters."""
+        if self.max_guidance_weight <= 0:
+            raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
+        if self.debug_maxlen <= 0:
+            raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
+
+
+--- policies/rtc/debug_tracker.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Debug information handler for Real-Time Chunking (RTC)."""
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+from torch import Tensor
+
+
+@dataclass
+class DebugStep:
+    """Container for debug information from a single denoising step.
+
+    Attributes:
+        step_idx (int): Step index/counter.
+        x_t (Tensor | None): Current latent/state tensor.
+        v_t (Tensor | None): Velocity from denoiser.
+        x1_t (Tensor | None): Denoised prediction (x_t - time * v_t).
+        correction (Tensor | None): Correction gradient tensor.
+        err (Tensor | None): Weighted error term.
+        weights (Tensor | None): Prefix attention weights.
+        guidance_weight (float | Tensor | None): Applied guidance weight.
+        time (float | Tensor | None): Time parameter.
+        inference_delay (int | None): Inference delay parameter.
+        execution_horizon (int | None): Execution horizon parameter.
+        metadata (dict[str, Any]): Additional metadata.
+    """
+
+    step_idx: int = 0
+    x_t: Tensor | None = None
+    v_t: Tensor | None = None
+    x1_t: Tensor | None = None
+    correction: Tensor | None = None
+    err: Tensor | None = None
+    weights: Tensor | None = None
+    guidance_weight: float | Tensor | None = None
+    time: float | Tensor | None = None
+    inference_delay: int | None = None
+    execution_horizon: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self, include_tensors: bool = False) -> dict[str, Any]:
+        """Convert debug step to dictionary.
+
+        Args:
+            include_tensors (bool): If True, include tensor values. If False, only include
+                tensor statistics (shape, mean, std, min, max).
+
+        Returns:
+            Dictionary representation of the debug step.
+        """
+        result = {
+            "step_idx": self.step_idx,
+            "guidance_weight": (
+                self.guidance_weight.item()
+                if isinstance(self.guidance_weight, Tensor)
+                else self.guidance_weight
+            ),
+            "time": self.time.item() if isinstance(self.time, Tensor) else self.time,
+            "inference_delay": self.inference_delay,
+            "execution_horizon": self.execution_horizon,
+            "metadata": self.metadata.copy(),
+        }
+
+        # Add tensor information
+        tensor_fields = ["x_t", "v_t", "x1_t", "correction", "err", "weights"]
+        for field_name in tensor_fields:
+            tensor = getattr(self, field_name)
+            if tensor is not None:
+                if include_tensors:
+                    result[field_name] = tensor.detach().cpu()
+                else:
+                    result[f"{field_name}_stats"] = {
+                        "shape": tuple(tensor.shape),
+                        "mean": tensor.mean().item(),
+                        "std": tensor.std().item(),
+                        "min": tensor.min().item(),
+                        "max": tensor.max().item(),
+                    }
+
+        return result
+
+
+class Tracker:
+    """Collects and manages debug information for RTC processing.
+
+    This tracker stores debug information from recent denoising steps in a dictionary,
+    using time as the key for efficient lookups and updates.
+
+    Args:
+        enabled (bool): Whether debug collection is enabled.
+        maxlen (int | None): Optional sliding window size. If provided, only the
+            most recent ``maxlen`` debug steps are kept. If ``None``, keeps all.
+    """
+
+    def __init__(self, enabled: bool = False, maxlen: int = 100):
+        self.enabled = enabled
+        self._steps = {} if enabled else None  # Dictionary with time as key
+        self._maxlen = maxlen
+        self._step_counter = 0
+
+    def reset(self) -> None:
+        """Clear all recorded debug information."""
+        if self.enabled and self._steps is not None:
+            self._steps.clear()
+        self._step_counter = 0
+
+    @torch._dynamo.disable
+    def track(
+        self,
+        time: float | Tensor,
+        x_t: Tensor | None = None,
+        v_t: Tensor | None = None,
+        x1_t: Tensor | None = None,
+        correction: Tensor | None = None,
+        err: Tensor | None = None,
+        weights: Tensor | None = None,
+        guidance_weight: float | Tensor | None = None,
+        inference_delay: int | None = None,
+        execution_horizon: int | None = None,
+        **metadata,
+    ) -> None:
+        """Track debug information for a denoising step at a given time.
+
+        If a step with the given time already exists, it will be updated with the new data.
+        Otherwise, a new step will be created. Only non-None fields are updated/set.
+
+        Note: This method is excluded from torch.compile to avoid graph breaks from
+        operations like .item() which are incompatible with compiled graphs.
+
+        Args:
+            time (float | Tensor): Time parameter - used as the key to identify the step.
+            x_t (Tensor | None): Current latent/state tensor.
+            v_t (Tensor | None): Velocity from denoiser.
+            x1_t (Tensor | None): Denoised prediction.
+            correction (Tensor | None): Correction gradient tensor.
+            err (Tensor | None): Weighted error term.
+            weights (Tensor | None): Prefix attention weights.
+            guidance_weight (float | Tensor | None): Applied guidance weight.
+            inference_delay (int | None): Inference delay parameter.
+            execution_horizon (int | None): Execution horizon parameter.
+            **metadata: Additional metadata to store.
+        """
+        if not self.enabled:
+            return
+
+        # Convert time to float and round to avoid float precision issues
+        time_value = time.item() if isinstance(time, Tensor) else time
+        time_key = round(time_value, 6)  # Use rounded time as dictionary key
+
+        # Check if step with this time already exists
+        if time_key in self._steps:
+            # Update existing step with non-None fields
+            existing_step = self._steps[time_key]
+            if x_t is not None:
+                existing_step.x_t = x_t.detach().clone()
+            if v_t is not None:
+                existing_step.v_t = v_t.detach().clone()
+            if x1_t is not None:
+                existing_step.x1_t = x1_t.detach().clone()
+            if correction is not None:
+                existing_step.correction = correction.detach().clone()
+            if err is not None:
+                existing_step.err = err.detach().clone()
+            if weights is not None:
+                existing_step.weights = weights.detach().clone()
+            if guidance_weight is not None:
+                existing_step.guidance_weight = guidance_weight
+            if inference_delay is not None:
+                existing_step.inference_delay = inference_delay
+            if execution_horizon is not None:
+                existing_step.execution_horizon = execution_horizon
+            if metadata:
+                existing_step.metadata.update(metadata)
+        else:
+            # Create new step
+            step = DebugStep(
+                step_idx=self._step_counter,
+                x_t=x_t.detach().clone() if x_t is not None else None,
+                v_t=v_t.detach().clone() if v_t is not None else None,
+                x1_t=x1_t.detach().clone() if x1_t is not None else None,
+                correction=correction.detach().clone() if correction is not None else None,
+                err=err.detach().clone() if err is not None else None,
+                weights=weights.detach().clone() if weights is not None else None,
+                guidance_weight=guidance_weight,
+                time=time_value,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                metadata=metadata,
+            )
+
+            # Add to dictionary
+            self._steps[time_key] = step
+            self._step_counter += 1
+
+            # Enforce maxlen if set
+            if self._maxlen is not None and len(self._steps) > self._maxlen:
+                # Remove oldest entry (first key in dict - Python 3.7+ preserves insertion order)
+                oldest_key = next(iter(self._steps))
+                del self._steps[oldest_key]
+
+    def get_all_steps(self) -> list[DebugStep]:
+        """Get all recorded debug steps.
+
+        Returns:
+            List of all DebugStep objects (may be empty if disabled).
+        """
+        if not self.enabled or self._steps is None:
+            return []
+
+        return list(self._steps.values())
+
+    def __len__(self) -> int:
+        """Return the number of recorded debug steps."""
+        if not self.enabled or self._steps is None:
+            return 0
+        return len(self._steps)
+
+
+--- policies/rtc/debug_visualizer.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Visualization utilities for RTC debug information."""
+
+import torch
+
+
+class RTCDebugVisualizer:
+    """Visualizer for RTC debug information.
+
+    This class provides methods to visualize debug information collected by the Tracker,
+    including corrections, errors, weights, and guidance weights over denoising steps.
+    """
+
+    @staticmethod
+    def plot_waypoints(
+        axes,
+        tensor,
+        start_from: int = 0,
+        color: str = "blue",
+        label: str = "",
+        alpha: float = 0.7,
+        linewidth: float = 2,
+        marker: str | None = None,
+        markersize: int = 4,
+    ):
+        """Plot trajectories across multiple dimensions.
+
+        This function plots a tensor's values across time for multiple dimensions,
+        with each dimension plotted on a separate axis.
+
+        Args:
+            axes: Array of matplotlib axes (one for each dimension).
+            tensor: The tensor to plot (can be torch.Tensor or numpy array).
+                   Shape should be (time_steps, num_dims) or (batch, time_steps, num_dims).
+            start_from: Starting index for the x-axis.
+            color: Color for the plot lines.
+            label: Label for the plot legend.
+            alpha: Transparency level for the plot.
+            linewidth: Width of the plot lines.
+            marker: Marker style for data points (e.g., 'o', 's', '^').
+            markersize: Size of the markers.
+        """
+        import numpy as np
+
+        # Handle None tensor
+        if tensor is None:
+            return
+
+        # Convert tensor to numpy if needed
+        tensor_np = tensor.detach().cpu().numpy() if isinstance(tensor, torch.Tensor) else tensor
+
+        # Handle different tensor shapes
+        if tensor_np.ndim == 3:
+            # If batch dimension present, take first batch
+            tensor_np = tensor_np[0]
+        elif tensor_np.ndim == 1:
+            # If 1D, reshape to (time_steps, 1)
+            tensor_np = tensor_np.reshape(-1, 1)
+
+        # Get dimensions
+        time_steps, num_dims = tensor_np.shape
+
+        # Create x-axis indices
+        x_indices = np.arange(start_from, start_from + time_steps)
+
+        # Plot each dimension on its corresponding axis
+        num_axes = len(axes) if hasattr(axes, "__len__") else 1
+        for dim_idx in range(min(num_dims, num_axes)):
+            ax = axes[dim_idx] if hasattr(axes, "__len__") else axes
+
+            # Plot the trajectory
+            if marker:
+                ax.plot(
+                    x_indices,
+                    tensor_np[:, dim_idx],
+                    color=color,
+                    label=label if dim_idx == 0 else "",  # Only show label once
+                    alpha=alpha,
+                    linewidth=linewidth,
+                    marker=marker,
+                    markersize=markersize,
+                )
+            else:
+                ax.plot(
+                    x_indices,
+                    tensor_np[:, dim_idx],
+                    color=color,
+                    label=label if dim_idx == 0 else "",  # Only show label once
+                    alpha=alpha,
+                    linewidth=linewidth,
+                )
+
+            # Add grid and labels if not already present
+            if not ax.xaxis.get_label().get_text():
+                ax.set_xlabel("Step", fontsize=10)
+            if not ax.yaxis.get_label().get_text():
+                ax.set_ylabel(f"Dim {dim_idx}", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+
+--- policies/rtc/latency_tracker.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Latency tracking utilities for Real-Time Chunking (RTC)."""
+
+from collections import deque
+
+import numpy as np
+
+
+class LatencyTracker:
+    """Tracks recent latencies and provides max/percentile queries.
+
+    Args:
+        maxlen (int | None): Optional sliding window size. If provided, only the
+            most recent ``maxlen`` latencies are kept. If ``None``, keeps all.
+    """
+
+    def __init__(self, maxlen: int = 100):
+        self._values = deque(maxlen=maxlen)
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear all recorded latencies."""
+        self._values.clear()
+        self.max_latency = 0.0
+
+    def add(self, latency: float) -> None:
+        """Add a latency sample (seconds)."""
+        # Ensure numeric and non-negative
+        val = float(latency)
+
+        if val < 0:
+            return
+        self._values.append(val)
+        self.max_latency = max(self.max_latency, val)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def max(self) -> float | None:
+        """Return the maximum latency or None if empty."""
+        return self.max_latency
+
+    def percentile(self, q: float) -> float | None:
+        """Return the q-quantile (q in [0,1]) of recorded latencies or None if empty."""
+        if not self._values:
+            return 0.0
+        q = float(q)
+        if q <= 0.0:
+            return min(self._values)
+        if q >= 1.0:
+            return self.max_latency
+        vals = np.array(list(self._values), dtype=np.float32)
+        return float(np.quantile(vals, q))
+
+    def p95(self) -> float | None:
+        """Return the 95th percentile latency or None if empty."""
+        return self.percentile(0.95)
+
+
+--- policies/rtc/modeling_rtc.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Real-Time Chunking (RTC) implementation for LeRobot.
+
+Based on Physical Intelligence's Kinetix implementation:
+https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/src/model.py#L214
+"""
+
+import logging
+import math
+
+import torch
+from torch import Tensor
+
+from lerobot.configs import RTCAttentionSchedule
+
+from .configuration_rtc import RTCConfig
+from .debug_tracker import Tracker
+
+logger = logging.getLogger(__name__)
+
+
+class RTCProcessor:
+    """Real-Time Chunking processor for action chunking policies.
+
+    This class implements RTC techniques including velocity calculation,
+    prefix attention, and adaptive chunk processing.
+    """
+
+    def __init__(self, rtc_config: RTCConfig):
+        self.rtc_config = rtc_config
+
+        self.tracker = None
+
+        if rtc_config.debug:
+            self.tracker = Tracker(
+                enabled=rtc_config.debug,
+                maxlen=rtc_config.debug_maxlen,
+            )
+
+    # ====================== Tracker Proxy Methods ======================
+    def track(
+        self,
+        time: float | Tensor,
+        x_t: Tensor | None = None,
+        v_t: Tensor | None = None,
+        x1_t: Tensor | None = None,
+        correction: Tensor | None = None,
+        err: Tensor | None = None,
+        weights: Tensor | None = None,
+        guidance_weight: float | Tensor | None = None,
+        inference_delay: int | None = None,
+        execution_horizon: int | None = None,
+        **metadata,
+    ) -> None:
+        """Proxy method to track debug information.
+
+        If tracker is None or disabled, this method does nothing.
+        Otherwise, it forwards the call to tracker.track().
+        """
+        if self.tracker is not None:
+            self.tracker.track(
+                time=time,
+                x_t=x_t,
+                v_t=v_t,
+                x1_t=x1_t,
+                correction=correction,
+                err=err,
+                weights=weights,
+                guidance_weight=guidance_weight,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                **metadata,
+            )
+
+    def get_all_debug_steps(self) -> list:
+        """Get all debug steps from tracker.
+
+        Returns empty list if tracker is disabled or None.
+        """
+        if self.tracker is not None:
+            return self.tracker.get_all_steps()
+        return []
+
+    def is_debug_enabled(self) -> bool:
+        """Check if debug tracking is enabled.
+
+        Returns True if tracker exists and is enabled.
+        """
+        return self.tracker is not None and self.tracker.enabled
+
+    def reset_tracker(self) -> None:
+        """Reset the tracker, clearing all recorded steps.
+
+        Does nothing if tracker is None.
+        """
+        if self.tracker is not None:
+            self.tracker.reset()
+
+    # ====================== End Tracker Proxy Methods ======================
+
+    def denoise_step(
+        self,
+        x_t,
+        prev_chunk_left_over,
+        inference_delay,
+        time,
+        original_denoise_step_partial,
+        execution_horizon=None,
+    ) -> Tensor:
+        """RTC guidance wrapper around an existing denoiser.
+
+        This method wraps an original denoising callable that only takes ``x_t`` and
+        returns a base denoised velocity ``v_t``. It then applies Real-Time Chunking
+        (RTC) prefix guidance using the leftover prefix from the previous chunk.
+
+        Args:
+            x_t (Tensor): Current latent/state to denoise. Shape ``(B, T, A)`` or ``(T, A)``.
+            prev_chunk_left_over (Tensor | None): Unexecuted prefix from the previous
+                chunk. Shape ``(B, T_prev, A)`` or ``(T_prev, A)``. If ``None``, no guidance
+                is applied and the method returns ``v_t`` from the original denoiser.
+            inference_delay (int): Number of timesteps from the prefix to use for guidance.
+            time (float | Tensor): Scalar in [0, 1] indicating normalized time. Must be
+                broadcastable with ``x_t``.
+            original_denoise_step_partial (Callable[[Tensor], Tensor]): Callable that
+                computes the base denoised velocity given only ``x_t``.
+            execution_horizon (int | None): Horizon used to build prefix weights. If
+                ``None``, defaults to ``self.rtc_config.execution_horizon``.
+
+        Returns:
+            Tensor: Guided velocity with the same shape as ``v_t``.
+
+        Notes:
+            - If inputs are 2D, a batch dimension is temporarily added and removed at the end.
+            - If ``prev_chunk_left_over`` is shorter than the current chunk length ``T``, it is
+              right-padded with zeros to match ``T``.
+            - Prefix weights are constructed via ``get_prefix_weights(inference_delay, execution_horizon, T)``
+              and broadcast to ``(B, T, A)``.
+            - Guidance correction is computed via autograd using ``x1_t = x_t + time * v_t`` and
+              ``error = (prev_chunk_left_over - x1_t) * weights``.
+            - The final guidance weight is clamped by ``max_guidance_weight`` from the config.
+
+        Reference:
+            https://www.physicalintelligence.company/download/real_time_chunking.pdf
+        """
+
+        # In the original implementation, the time goes from 0 to 1 and
+        # In our implementation, the time goes from 1 to 0
+        # So we need to invert the time
+        tau = 1 - time
+
+        if prev_chunk_left_over is None:
+            # First step, no guidance - return v_t
+            v_t = original_denoise_step_partial(x_t)
+            return v_t
+
+        x_t = x_t.clone().detach()
+
+        squeezed = False
+        if len(x_t.shape) < 3:
+            # Add batch dimension
+            x_t = x_t.unsqueeze(0)
+            squeezed = True
+
+        if len(prev_chunk_left_over.shape) < 3:
+            # Add batch dimension
+            prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+
+        if execution_horizon is None:
+            execution_horizon = self.rtc_config.execution_horizon
+
+        # If the previous action chunk is to short then it doesn't make sense to use long execution horizon
+        # because there is nothing to merge
+        if execution_horizon > prev_chunk_left_over.shape[1]:
+            execution_horizon = prev_chunk_left_over.shape[1]
+
+        batch_size = x_t.shape[0]
+        action_chunk_size = x_t.shape[1]
+        action_dim = x_t.shape[2]
+
+        if prev_chunk_left_over.shape[1] < action_chunk_size or prev_chunk_left_over.shape[2] < action_dim:
+            padded = torch.zeros(batch_size, action_chunk_size, action_dim).to(x_t.device)
+            padded[:, : prev_chunk_left_over.shape[1], : prev_chunk_left_over.shape[2]] = prev_chunk_left_over
+            prev_chunk_left_over = padded
+
+        assert prev_chunk_left_over.shape == x_t.shape, (
+            "The padded previous chunk must be the same size as the input tensor"
+        )
+
+        weights = (
+            self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
+            .to(x_t.device)
+            .unsqueeze(0)
+            .unsqueeze(-1)
+        )
+
+        with torch.enable_grad():
+            v_t = original_denoise_step_partial(x_t)
+            x_t.requires_grad_(True)
+
+            x1_t = x_t - time * v_t  # noqa: N806
+            err = (prev_chunk_left_over - x1_t) * weights
+            grad_outputs = err.clone().detach()
+            correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+
+        max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
+        tau_tensor = torch.as_tensor(tau)
+        squared_one_minus_tau = (1 - tau_tensor) ** 2
+        inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+        guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
+
+        result = v_t - guidance_weight * correction
+
+        # Remove the batch dimension if it was added
+        if squeezed:
+            result = result.squeeze(0)
+            correction = correction.squeeze(0)
+            x1_t = x1_t.squeeze(0)
+            err = err.squeeze(0)
+
+        self.track(
+            time=time,
+            x1_t=x1_t,
+            correction=correction,
+            err=err,
+            weights=weights,
+            guidance_weight=guidance_weight,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+        )
+
+        return result
+
+    def get_prefix_weights(self, start, end, total):
+        start = min(start, end)
+
+        if self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ZEROS:
+            weights = torch.zeros(total)
+            weights[:start] = 1.0
+        elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ONES:
+            weights = torch.ones(total)
+            weights[end:] = 0.0
+        elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR:
+            lin_weights = self._linweights(start, end, total)
+            weights = self._add_trailing_zeros(lin_weights, total, end)
+            weights = self._add_leading_ones(weights, start, total)
+        elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.EXP:
+            lin_weights = self._linweights(start, end, total)
+            lin_weights = lin_weights * torch.expm1(lin_weights).div(math.e - 1)
+            weights = self._add_trailing_zeros(lin_weights, total, end)
+            weights = self._add_leading_ones(weights, start, total)
+
+        return weights
+
+    def _linweights(self, start, end, total):
+        skip_steps_at_end = max(total - end, 0)
+
+        linspace_steps = total - skip_steps_at_end - start
+
+        if end <= start or linspace_steps <= 0:
+            return torch.tensor([])
+
+        return torch.linspace(1, 0, linspace_steps + 2)[1:-1]
+
+    def _add_trailing_zeros(self, weights, total, end):
+        zeros_len = total - end
+
+        if zeros_len <= 0:
+            return weights
+
+        zeros = torch.zeros(zeros_len)
+        return torch.cat([weights, zeros])
+
+    def _add_leading_ones(self, weights, start, total):
+        ones_len = min(start, total)
+
+        if ones_len <= 0:
+            return weights
+
+        ones = torch.ones(ones_len)
+        return torch.cat([ones, weights])
+
+
+--- policies/rtc/relative.py ---
+#!/usr/bin/env python
+
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Relative-action helpers for Real-Time Chunking (RTC)."""
+
+from __future__ import annotations
+
+import torch
+
+from lerobot.processor import (
+    NormalizerProcessorStep,
+    RelativeActionsProcessorStep,
+    TransitionKey,
+    create_transition,
+    to_relative_actions,
+)
+
+
+def reanchor_relative_rtc_prefix(
+    prev_actions_absolute: torch.Tensor,
+    current_state: torch.Tensor,
+    relative_step: RelativeActionsProcessorStep,
+    normalizer_step: NormalizerProcessorStep | None,
+    policy_device: torch.device | str,
+) -> torch.Tensor:
+    """Convert absolute leftover actions into model-space for relative-action RTC policies.
+
+    When using relative actions, the RTC prefix (previous chunk's unexecuted tail)
+    is stored in absolute coordinates. Before feeding it back to the policy, this
+    helper re-expresses those actions relative to the robot's current joint state
+    and optionally normalizes them so the policy receives correctly scaled inputs.
+    """
+    state = current_state.detach().cpu()
+    if state.dim() == 1:
+        state = state.unsqueeze(0)
+
+    action_cpu = prev_actions_absolute.detach().cpu()
+    mask = relative_step._build_mask(action_cpu.shape[-1])
+    relative_actions = to_relative_actions(action_cpu, state, mask)
+
+    transition = create_transition(action=relative_actions)
+    if normalizer_step is not None:
+        transition = normalizer_step(transition)
+
+    return transition[TransitionKey.ACTION].to(policy_device)
+
+
+--- rollout/inference/rtc.py ---
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Real-Time Chunking inference engine.
+
+A background thread produces action chunks asynchronously via
+:meth:`policy.predict_action_chunk`.  The main control loop polls
+``get_action`` for the next ready action; observations flow the other
+way via ``notify_observation``.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import math
+import time
+import traceback
+from threading import Event, Lock, Thread
+from typing import Any
+
+import torch
+
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.processor import (
+    NormalizerProcessorStep,
+    PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
+)
+from lerobot.utils.feature_utils import build_dataset_frame
+
+from ..robot_wrapper import ThreadSafeRobot
+from .base import InferenceEngine
+
+logger = logging.getLogger(__name__)
+
+# How long the RTC loop sleeps when paused, idle, or backpressured by a full queue.
+_RTC_IDLE_SLEEP_S: float = 0.01
+# Backoff between transient inference errors (per consecutive failure).
+_RTC_ERROR_RETRY_DELAY_S: float = 0.5
+# Consecutive transient errors tolerated before giving up and propagating shutdown.
+_RTC_MAX_CONSECUTIVE_ERRORS: int = 10
+# Hard timeout for joining the RTC thread on stop().
+_RTC_JOIN_TIMEOUT_S: float = 3.0
+
+
+# ---------------------------------------------------------------------------
+# RTC helpers
+# ---------------------------------------------------------------------------
+
+
+def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
+    """Whether a policy declares RTC support and accepts the RTC call shape."""
+    supports_rtc = getattr(policy, "supports_rtc", None)
+    if not callable(supports_rtc) or not supports_rtc():
+        return False
+
+    try:
+        inspect.signature(policy.predict_action_chunk).bind(
+            object(),
+            inference_delay=0,
+            prev_chunk_left_over=None,
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int) -> torch.Tensor:
+    """Pad or truncate RTC prefix actions to a fixed length for stable compiled inference."""
+    if prev_actions.ndim != 2:
+        raise ValueError(f"Expected 2D [T, A] tensor, got shape={tuple(prev_actions.shape)}")
+    steps, action_dim = prev_actions.shape
+    if steps == target_steps:
+        return prev_actions
+    if steps > target_steps:
+        return prev_actions[:target_steps]
+    padded = torch.zeros((target_steps, action_dim), dtype=prev_actions.dtype, device=prev_actions.device)
+    padded[:steps] = prev_actions
+    return padded
+
+
+# ---------------------------------------------------------------------------
+# RTCInferenceEngine
+# ---------------------------------------------------------------------------
+
+
+class RTCInferenceEngine(InferenceEngine):
+    """Async RTC inference: a background thread produces action chunks.
+
+    ``get_action`` pops the next action from the shared queue (or
+    returns ``None`` if the queue is empty).  The main loop should call
+    ``notify_observation`` every tick and ``pause``/``resume`` around
+    human-intervention phases.
+    """
+
+    def __init__(
+        self,
+        policy: PreTrainedPolicy,
+        preprocessor: PolicyProcessorPipeline,
+        postprocessor: PolicyProcessorPipeline,
+        robot_wrapper: ThreadSafeRobot,
+        rtc_config: RTCConfig,
+        hw_features: dict,
+        task: str,
+        fps: float,
+        device: str | None,
+        use_torch_compile: bool = False,
+        compile_warmup_inferences: int = 2,
+        rtc_queue_threshold: int = 30,
+        shutdown_event: Event | None = None,
+    ) -> None:
+        self._policy = policy
+        self._preprocessor = preprocessor
+        self._postprocessor = postprocessor
+        self._robot = robot_wrapper
+        self._rtc_config = rtc_config
+        self._hw_features = hw_features
+        self._task = task
+        self._fps = fps
+        self._device = device or "cpu"
+        self._use_torch_compile = use_torch_compile
+        self._compile_warmup_inferences = compile_warmup_inferences
+        self._rtc_queue_threshold = rtc_queue_threshold
+
+        self._action_queue: ActionQueue | None = None
+        self._obs_holder: dict[str, Any] = {}
+        self._obs_lock = Lock()
+        self._policy_active = Event()
+        self._compile_warmup_done = Event()
+        self._shutdown_event = Event()
+        self._rtc_error = Event()
+        self._global_shutdown_event = shutdown_event
+        self._rtc_thread: Thread | None = None
+
+        if not self._use_torch_compile:
+            self._compile_warmup_done.set()
+            logger.info("RTCInferenceEngine initialized (torch.compile disabled, no warmup needed)")
+        else:
+            logger.info(
+                "RTCInferenceEngine initialized (torch.compile enabled, %d warmup inferences)",
+                compile_warmup_inferences,
+            )
+
+        # Processor introspection for relative-action re-anchoring.
+        self._relative_step = next(
+            (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
+            None,
+        )
+        self._normalizer_step = next(
+            (s for s in preprocessor.steps if isinstance(s, NormalizerProcessorStep)),
+            None,
+        )
+        if self._relative_step is not None:
+            if self._relative_step.action_names is None:
+                cfg_names = getattr(policy.config, "action_feature_names", None)
+                if cfg_names:
+                    self._relative_step.action_names = list(cfg_names)
+                else:
+                    self._relative_step.action_names = [
+                        k for k in robot_wrapper.action_features if k.endswith(".pos")
+                    ]
+            logger.info("Relative actions enabled: RTC prefix will be re-anchored")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def ready(self) -> bool:
+        """True once torch.compile warmup is complete (or immediately if compile is disabled)."""
+        return self._compile_warmup_done.is_set()
+
+    @property
+    def failed(self) -> bool:
+        """True if the RTC background thread exited due to an unrecoverable error."""
+        return self._rtc_error.is_set()
+
+    @property
+    def action_queue(self) -> ActionQueue | None:
+        """The shared action queue between the RTC thread and the main loop."""
+        return self._action_queue
+
+    def start(self) -> None:
+        """Launch the RTC background thread."""
+        self._action_queue = ActionQueue(self._rtc_config)
+        self._obs_holder = {
+            "obs": None,
+            "robot_type": self._robot.robot_type,
+        }
+        self._shutdown_event.clear()
+        self._rtc_thread = Thread(
+            target=self._rtc_loop,
+            daemon=True,
+            name="RTCInference",
+        )
+        self._rtc_thread.start()
+        logger.info("RTC inference thread started")
+
+    def stop(self) -> None:
+        """Signal the RTC thread to stop and wait for it."""
+        logger.info("Stopping RTC inference thread...")
+        self._shutdown_event.set()
+        self._policy_active.clear()
+        if self._rtc_thread is not None and self._rtc_thread.is_alive():
+            self._rtc_thread.join(timeout=_RTC_JOIN_TIMEOUT_S)
+            if self._rtc_thread.is_alive():
+                logger.warning("RTC thread did not join within %.1fs", _RTC_JOIN_TIMEOUT_S)
+            else:
+                logger.info("RTC inference thread stopped")
+            self._rtc_thread = None
+
+    def pause(self) -> None:
+        """Pause the RTC background thread."""
+        logger.info("Pausing RTC inference thread")
+        self._policy_active.clear()
+
+    def resume(self) -> None:
+        """Resume the RTC background thread."""
+        logger.info("Resuming RTC inference thread")
+        self._policy_active.set()
+
+    def reset(self) -> None:
+        """Reset the policy, processors, and action queue."""
+        logger.info("Resetting RTC inference state (policy + processors + queue)")
+        self._policy.reset()
+        self._preprocessor.reset()
+        self._postprocessor.reset()
+        if self._action_queue is not None:
+            self._action_queue.clear()
+
+    # ------------------------------------------------------------------
+    # Action production (called from main thread)
+    # ------------------------------------------------------------------
+
+    def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
+        """Pop the next action from the RTC queue (ignores ``obs_frame``)."""
+        if self._action_queue is None:
+            return None
+        return self._action_queue.get()
+
+    def notify_observation(self, obs: dict) -> None:
+        """Publish the latest observation for the RTC thread to consume."""
+        with self._obs_lock:
+            self._obs_holder["obs"] = obs
+
+    # ------------------------------------------------------------------
+    # RTC: background inference thread
+    # ------------------------------------------------------------------
+
+    def _rtc_loop(self) -> None:
+        """Background thread that generates action chunks via RTC."""
+        try:
+            latency_tracker = LatencyTracker()
+            time_per_chunk = 1.0 / self._fps
+            policy_device = torch.device(self._device)
+
+            warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
+            inference_count = 0
+            consecutive_errors = 0
+
+            while not self._shutdown_event.is_set():
+                if not self._policy_active.is_set():
+                    time.sleep(_RTC_IDLE_SLEEP_S)
+                    continue
+
+                queue = self._action_queue
+                with self._obs_lock:
+                    obs = self._obs_holder.get("obs")
+                if queue is None or obs is None:
+                    time.sleep(_RTC_IDLE_SLEEP_S)
+                    continue
+
+                if queue.qsize() <= self._rtc_queue_threshold:
+                    try:
+                        current_time = time.perf_counter()
+                        idx_before = queue.get_action_index()
+                        prev_actions = queue.get_left_over()
+
+                        latency = latency_tracker.max()
+                        delay = math.ceil(latency / time_per_chunk) if latency else 0
+
+                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                        obs_batch = prepare_observation_for_inference(
+                            obs_batch, policy_device, self._task, self._robot.robot_type
+                        )
+                        obs_batch["task"] = [self._task]
+
+                        preprocessed = self._preprocessor(obs_batch)
+
+                        if prev_actions is not None and self._relative_step is not None:
+                            # Rebase against the raw cached state so the leftover tail stays in
+                            # the training-time coordinate frame.
+                            raw_state = self._relative_step.get_cached_state()
+                            if raw_state is not None:
+                                prev_abs = queue.get_processed_left_over()
+                                if prev_abs is not None and prev_abs.numel() > 0:
+                                    prev_actions = reanchor_relative_rtc_prefix(
+                                        prev_actions_absolute=prev_abs,
+                                        current_state=raw_state,
+                                        relative_step=self._relative_step,
+                                        normalizer_step=self._normalizer_step,
+                                        policy_device=policy_device,
+                                    )
+
+                        if prev_actions is not None:
+                            prev_actions = _normalize_prev_actions_length(
+                                prev_actions, target_steps=self._rtc_config.execution_horizon
+                            )
+
+                        actions = self._policy.predict_action_chunk(
+                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                        )
+
+                        original = actions.squeeze(0).clone()
+                        processed = self._postprocessor(actions).squeeze(0)
+                        new_latency = time.perf_counter() - current_time
+                        new_delay = math.ceil(new_latency / time_per_chunk)
+
+                        inference_count += 1
+                        consecutive_errors = 0
+                        is_warmup = self._use_torch_compile and inference_count <= warmup_required
+                        if is_warmup:
+                            latency_tracker.reset()
+                        else:
+                            latency_tracker.add(new_latency)
+
+                        queue.merge(original, processed, new_delay, idx_before)
+
+                        if (
+                            is_warmup
+                            and inference_count >= warmup_required
+                            and not self._compile_warmup_done.is_set()
+                        ):
+                            self._compile_warmup_done.set()
+                            logger.info("Compile warmup complete (%d inferences)", inference_count)
+
+                        logger.debug("RTC inference latency=%.2fs, queue=%d", new_latency, queue.qsize())
+
+                    except Exception as e:
+                        consecutive_errors += 1
+                        logger.error(
+                            "RTC inference error (%d/%d): %s",
+                            consecutive_errors,
+                            _RTC_MAX_CONSECUTIVE_ERRORS,
+                            e,
+                        )
+                        logger.debug(traceback.format_exc())
+                        if consecutive_errors >= _RTC_MAX_CONSECUTIVE_ERRORS:
+                            # Persistent failure: stop retrying and propagate shutdown.
+                            raise
+                        time.sleep(_RTC_ERROR_RETRY_DELAY_S)
+                else:
+                    time.sleep(_RTC_IDLE_SLEEP_S)
+
+        except Exception as e:
+            logger.error("Fatal error in RTC thread: %s", e)
+            logger.error(traceback.format_exc())
+            self._rtc_error.set()
+            # Unblock any warmup waiters so the main loop doesn't spin forever
+            self._compile_warmup_done.set()
+            # Signal the top-level shutdown so strategies exit their control loops
+            if self._global_shutdown_event is not None:
+                self._global_shutdown_event.set()
+
+
+=== Current server ===
+import base64
+import io
+import json
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import numpy as np
+from PIL import Image
+import torch
+
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+from lerobot.policies.factory import make_pre_post_processors
+
+CHECKPOINT = (
+    "/root/autodl-tmp/pi05/outputs/pi05_recovery_cosine_tc_v1/"
+    "checkpoints/002000/pretrained_model"
+)
+TASK = (
+    "Pick up the yellow cube from inside the black outlined area "
+    "and place it in the gray-blue tray."
+)
+
+cfg = PI05Config.from_pretrained(CHECKPOINT)
+cfg.pretrained_path = CHECKPOINT
+cfg.device = "cuda"
+cfg.compile_model = True
+cfg.compile_mode = "reduce-overhead"
+cfg.gradient_checkpointing = False
+cfg.num_inference_steps = 10
+assert cfg.chunk_size == 50, cfg.chunk_size
+
+print("CHECKPOINT:", CHECKPOINT, flush=True)
+print("TASK:", TASK, flush=True)
+print("Loading policy...", flush=True)
+
+policy = PI05Policy.from_pretrained(
+    CHECKPOINT, config=cfg, strict=True, local_files_only=True
+).eval()
+
+pre, post = make_pre_post_processors(
+    policy_cfg=cfg,
+    pretrained_path=CHECKPOINT,
+)
+
+@torch.inference_mode()
+def predict(obs):
+    torch.compiler.cudagraph_mark_step_begin()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    batch = pre(obs)
+    normalized = policy.predict_action_chunk(batch)
+    actions = post(normalized).detach().to("cpu", copy=True)
+    torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if tuple(actions.shape) != (1, 50, 6):
+        raise RuntimeError(f"Unexpected action shape: {actions.shape}")
+    if not torch.isfinite(actions).all():
+        raise RuntimeError("Non-finite actions")
+    return actions[0].tolist(), elapsed_ms
+
+def decode_image(encoded):
+    raw = base64.b64decode(encoded, validate=True)
+    with Image.open(io.BytesIO(raw)) as image:
+        if image.size != (640, 480):
+            raise ValueError(f"Expected 640x480 image, got {image.size}")
+        array = np.array(image.convert("RGB"), copy=True)
+    return torch.from_numpy(array).permute(2, 0, 1).float() / 255.0
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.reply(200, {
+                "ready": True,
+                "chunk_size": 50,
+                "checkpoint": CHECKPOINT,
+                "task": TASK,
+            })
+        else:
+            self.reply(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if self.path != "/infer":
+            self.reply(404, {"error": "Not found"})
+            return
+        try:
+            start = time.perf_counter()
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 8_000_000:
+                raise ValueError("Invalid request size")
+
+            request = json.loads(self.rfile.read(length))
+            state = torch.tensor(request["state"], dtype=torch.float32)
+            if state.shape != (6,) or not torch.isfinite(state).all():
+                raise ValueError("Expected 6 finite state values")
+
+            obs = {
+                "observation.images.front": decode_image(request["front"]),
+                "observation.images.wrist": decode_image(request["wrist"]),
+                "observation.state": state,
+                "task": TASK,
+            }
+            actions, inference_ms = predict(obs)
+            server_ms = (time.perf_counter() - start) * 1000
+            self.reply(200, {
+                "actions": actions,
+                "inference_ms": inference_ms,
+                "server_ms": server_ms,
+            })
+            print(
+                f"inference={inference_ms:.1f} ms "
+                f"server={server_ms:.1f} ms",
+                flush=True,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self.reply(500, {"error": str(exc)})
+
+# 提前占用端口，重复启动时立即报错，避免重复加载模型后的预热。
+server = HTTPServer(("127.0.0.1", 8087), Handler)
+
+print("Warming up; first call may take several minutes...", flush=True)
+for i in range(5):
+    obs = {
+        "observation.images.front": torch.zeros(3, 480, 640),
+        "observation.images.wrist": torch.zeros(3, 480, 640),
+        "observation.state": torch.tensor(
+            [-12.8868, -21.2417, 18.5084, 79.0358, 11.2939, 3.4916]
+        ),
+        "task": TASK,
+    }
+    _, ms = predict(obs)
+    print(f"warmup {i + 1}/5: {ms:.1f} ms", flush=True)
+
+print("SERVER_READY http://127.0.0.1:8087", flush=True)
+server.serve_forever()
+
