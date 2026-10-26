@@ -10,7 +10,7 @@
 
 ![SO-ARM101 抓取放置演示](VID_20261025_193225-ezgif.com-cut.gif)
 
-完整25次抓取：
+完整25次抓取（包含自主调节和全部方位）：https://www.bilibili.com/video/BV1zznd61EZF/?share_source=copy_web&vd_source=059f647dfdb9f59309fe00d5e8117d88
 
 ## 项目工作与实现边界
 
