@@ -13,3 +13,5 @@ outputs/
 *.pth
 *.zip
 *.pid
+
+.git (*)/
