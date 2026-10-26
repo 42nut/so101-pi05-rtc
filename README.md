@@ -6,7 +6,7 @@
 
 模型权重：[the42thnut/pi05-so101-cube-dagger](https://huggingface.co/the42thnut/pi05-so101-cube-dagger)。仓库整理实际运行文件。
 
-## 真机演示
+## 真机演示（均为4倍速播放）
 
 ![SO-ARM101 抓取放置演示](VID_20261025_193225-ezgif.com-cut.gif)
 
