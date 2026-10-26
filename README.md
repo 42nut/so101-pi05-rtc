@@ -8,7 +8,9 @@
 
 ## 真机演示
 
-![SO-ARM101 抓取放置演示](assets/so101-pick-place.gif)
+![SO-ARM101 抓取放置演示](VID_20261025_193225-ezgif.com-cut.gif)
+
+完整25次抓取：
 
 ## 项目工作与实现边界
 
