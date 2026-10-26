@@ -6,6 +6,10 @@
 
 模型权重：[the42thnut/pi05-so101-cube-dagger](https://huggingface.co/the42thnut/pi05-so101-cube-dagger)。仓库整理实际运行文件。
 
+## 真机演示
+
+![SO-ARM101 抓取放置演示](assets/so101-pick-place.gif)
+
 ## 项目工作与实现边界
 
 - **真机数据闭环**：使用主从臂遥操作采集基础示范，针对抓取偏差、空抓等失败状态补充纠错示范，再结合策略运行暴露的问题采集 DAgger 阶段数据。
